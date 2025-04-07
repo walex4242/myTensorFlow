@@ -1,0 +1,6 @@
+@myTensorFlow_HostAddress = http://localhost:5003
+
+GET {{myTensorFlow_HostAddress}}/weatherforecast/
+Accept: application/json
+
+###
