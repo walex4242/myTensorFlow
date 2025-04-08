@@ -1,7 +1,3 @@
-using Lucene.Net.Analysis;
-using Lucene.Net.Analysis.En;
-using Lucene.Net.Analysis.Util;
-using Lucene.Net.Util;
 using System.Text.RegularExpressions;
 
 public partial class TextProcessingService
@@ -23,7 +19,8 @@ public partial class TextProcessingService
         // Add more stop words as needed
     };
 
-    private readonly LuceneVersion _luceneVersion = LuceneVersion.LUCENE_48;
+    [GeneratedRegex(@"[^a-z0-9\s]")]
+    private static partial Regex MyRegex();
 
     public string PreprocessText(string text)
     {
@@ -35,30 +32,8 @@ public partial class TextProcessingService
         text = text.ToLowerInvariant();
         text = MyRegex().Replace(text, " ");
         string[] tokens = text.Split([' ', '\t', '\n', '\r'], StringSplitOptions.RemoveEmptyEntries);
-        tokens = [.. tokens.Where(token => !_stopWords.Contains(token))];
+        tokens = tokens.Where(token => !_stopWords.Contains(token)).ToArray();
 
-        // Use Lucene.Net Analyzer for stemming
-        using (Analyzer analyzer = new EnglishAnalyzer(_luceneVersion, CharArraySet.EMPTY_SET)) // EnglishAnalyzer includes StopFilter and PorterStemFilter
-        {
-            List<string> stemmedTokens = new List<string>();
-            foreach (var token in tokens)
-            {
-                using (var reader = new StringReader(token))
-                using (var tokenStream = analyzer.GetTokenStream("content", reader))
-                {
-                    var termAttribute = tokenStream.GetAttribute<Lucene.Net.Analysis.TokenAttributes.ICharTermAttribute>();
-                    tokenStream.Reset();
-                    if (tokenStream.IncrementToken())
-                    {
-                        stemmedTokens.Add(termAttribute.ToString());
-                    }
-                    tokenStream.End();
-                }
-            }
-            return string.Join(" ", stemmedTokens).Trim();
-        }
+        return string.Join(" ", tokens).Trim();
     }
-
-    [GeneratedRegex(@"[^a-z0-9\s]")]
-    private static partial Regex MyRegex();
 }

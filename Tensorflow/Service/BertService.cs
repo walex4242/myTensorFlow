@@ -1,150 +1,122 @@
-// using System;
-// using System.Collections.Generic;
-// using System.Linq;
-// using Bert.Net.Tokenizer; // Adjust this namespace if needed
-// using Tensorflow;
+using System.Text.Json;
 
-// public class BertService
-// {
-//    private readonly SavedModelBundle _model;
-//    private readonly BertTokenizer _tokenizer;
-//    private readonly int _maxSequenceLength = 128; // Adjust as needed
+public partial class BertService
+{
+    public EmbeddingData LoadedEmbeddings { get; private set; }
 
-//    // Input tensor names from the Python script output
-//    private const string InputIdsName = "input_word_ids";
-//    private const string AttentionMaskName = "input_mask";
-//    private const string TokenTypeIdsName = "input_type_ids";
+    public void LoadEmbeddings(string filePath)
+    {
+        LoadedEmbeddings = ReadEmbeddingsFromFile(filePath);
+        if (LoadedEmbeddings == null)
+        {
+            Console.WriteLine("Failed to load embeddings.");
+        }
+    }
 
-//    // Output tensor names from the Python script output (adjust based on your needs)
-//    private const string SentenceEmbeddingName = "Identity:0";       // Assuming this is the sentence embedding
-//    private const string TokenEmbeddingsName = "Identity_1:0";     // Assuming this is the token embeddings
+    public List<SentenceEmbedding> GetSentenceEmbeddingsFromLoadedData()
+    {
+        return LoadedEmbeddings?.Sentences;
+    }
 
-//    public BertService(string modelPath, string vocabularyPath)
-//    {
-//        try
-//        {
-//            _model = tf.saved_model.load(modelPath);
-//            _tokenizer = new BertTokenizer(vocabularyPath);
-//        }
-//        catch (Exception ex)
-//        {
-//            Console.WriteLine($"Error loading BERT model or vocabulary: {ex.Message}");
-//            throw;
-//        }
-//    }
+    public EmbeddingData ReadEmbeddingsFromFile(string filePath)
+    {
+        try
+        {
+            string jsonString = File.ReadAllText(filePath);
+            EmbeddingData data = JsonSerializer.Deserialize<EmbeddingData>(jsonString);
+            return data;
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Error reading embeddings from file: {ex.Message}");
+            return null;
+        }
+    }
+}
 
-//    public float[] GetSentenceEmbedding(string text)
-//    {
-//        if (_model == null || _tokenizer == null)
-//        {
-//            Console.WriteLine("BERT model or tokenizer not initialized.");
-//            return null;
-//        }
+public class SummarizationService
+{
+    private readonly BertService _bertService;
 
-//        var encoding = _tokenizer.Encode(text.Take(_maxSequenceLength).ToList(), _maxSequenceLength);
+    public SummarizationService(BertService bertService)
+    {
+        _bertService = bertService;
+    }
 
-//        var inputIdsTensor = tf.constant(encoding.Select(x => (long)x.InputIds).ToArray(), TF_INT64, new long[] { 1, _maxSequenceLength });
-//        var attentionMaskTensor = tf.constant(encoding.Select(x => (long)x.AttentionMask).ToArray(), TF_INT64, new long[] { 1, _maxSequenceLength });
-//        var tokenTypeIdsTensor = tf.constant(encoding.Select(x => (long)x.TokenTypeIds).ToArray(), TF_INT64, new long[] { 1, _maxSequenceLength });
+    public string GenerateSummary(string documentText)
+    {
+        var sentenceEmbeddings = _bertService.GetSentenceEmbeddingsFromLoadedData();
+        if (sentenceEmbeddings == null || !sentenceEmbeddings.Any())
+        {
+            return "Could not generate summary due to missing embeddings.";
+        }
 
-//        try
-//        {
-//            var runner = _model.signatures["serving_default"];
-//            var feed = new Dictionary<string, Tensor>
-//            {
-//                { InputIdsName, inputIdsTensor },
-//                { AttentionMaskName, attentionMaskTensor },
-//                { TokenTypeIdsName, tokenTypeIdsTensor }
-//            };
-//            var results = runner.Call(feed);
+        // 1. Calculate the document embedding (average of sentence embeddings)
+        var documentEmbedding = sentenceEmbeddings
+            .Where(s => s.Embedding != null && s.Embedding.Any())
+            .Select(s => s.Embedding) // Access the inner List<float>
+            .Aggregate((acc, vec) =>
+            {
+                if (acc == null) return vec;
+                return acc.Zip(vec, (a, b) => a + b).ToList();
+            })
+            .Select(x => (float)x / (sentenceEmbeddings.Count > 0 ? sentenceEmbeddings.Count : 1)) // Cast to float
+            .ToList();
 
-//            var sentenceEmbeddingTensor = results[SentenceEmbeddingName];
-//            var sentenceEmbedding = sentenceEmbeddingTensor.numpy();
+        // Handle the case where there are no valid embeddings
+        if (documentEmbedding == null || !documentEmbedding.Any())
+        {
+            return "Could not generate summary due to issues with embedding calculation.";
+        }
 
-//            // Assuming the shape is [1, embedding_size], we take the first element
-//            return JaggedArrayToSingleDimensional(sentenceEmbedding);
-//        }
-//        catch (Exception ex)
-//        {
-//            Console.WriteLine($"Error during BERT inference for sentence embedding: {ex.Message}");
-//            return null;
-//        }
-//    }
+        // 2. Calculate cosine similarity between each sentence embedding and the document embedding
+        var sentenceScores = sentenceEmbeddings
+            .Where(s => s.Embedding != null && s.Embedding.Any())
+            .Select(sentence =>
+            {
+                double similarity = CosineSimilarity(sentence.Embedding, documentEmbedding);
+                return new { Sentence = sentence.Text, Score = similarity, OriginalIndex = sentenceEmbeddings.IndexOf(sentence) };
+            })
+            .OrderByDescending(s => s.Score)
+            .ToList();
 
-//    public float[][] GetTokenEmbeddings(string text)
-//    {
-//        if (_model == null || _tokenizer == null)
-//        {
-//            Console.WriteLine("BERT model or tokenizer not initialized.");
-//            return null;
-//        }
+        // 3. Select the top N sentences (e.g., based on a desired summary length)
+        int summaryLength = Math.Min(5, sentenceScores.Count);
+        var topSentences = sentenceScores
+            .Take(summaryLength)
+            .OrderBy(s => s.OriginalIndex)
+            .Select(s => s.Sentence);
 
-//        var encoding = _tokenizer.Encode(text.Take(_maxSequenceLength).ToList(), _maxSequenceLength);
+        // 4. Join the selected sentences to form the summary
+        return string.Join(" ", topSentences);
+    }
 
-//        var inputIdsTensor = tf.constant(encoding.Select(x => (long)x.InputIds).ToArray(), TF_INT64, new long[] { 1, _maxSequenceLength });
-//        var attentionMaskTensor = tf.constant(encoding.Select(x => (long)x.AttentionMask).ToArray(), TF_INT64, new long[] { 1, _maxSequenceLength });
-//        var tokenTypeIdsTensor = tf.constant(encoding.Select(x => (long)x.TokenTypeIds).ToArray(), TF_INT64, new long[] { 1, _maxSequenceLength });
+    private double CosineSimilarity(List<float> vecA, List<float> vecB)
+    {
+        if (vecA == null || vecB == null || vecA.Count != vecB.Count)
+        {
+            return 0.0;
+        }
 
-//        try
-//        {
-//            var runner = _model.signatures["serving_default"];
-//            var feed = new Dictionary<string, Tensor>
-//            {
-//                { InputIdsName, inputIdsTensor },
-//                { AttentionMaskName, attentionMaskTensor },
-//                { TokenTypeIdsName, tokenTypeIdsTensor }
-//            };
-//            var results = runner.Call(feed);
+        double dotProduct = 0;
+        double normA = 0;
+        double normB = 0;
 
-//            var tokenEmbeddingsTensor = results[TokenEmbeddingsName];
-//            return JaggedArrayToMultiDimensional(tokenEmbeddingsTensor.numpy());
-//        }
-//        catch (Exception ex)
-//        {
-//            Console.WriteLine($"Error during BERT inference for token embeddings: {ex.Message}");
-//            return null;
-//        }
-//    }
+        for (int i = 0; i < vecA.Count; i++)
+        {
+            dotProduct += vecA[i] * vecB[i];
+            normA += Math.Pow(vecA[i], 2);
+            normB += Math.Pow(vecB[i], 2);
+        }
 
-//    // Helper function to convert jagged array (likely [1, seq_len, embedding_dim]) to multi-dimensional array [seq_len, embedding_dim]
-//    private static float[][] JaggedArrayToMultiDimensional(Array jaggedArray)
-//    {
-//        if (jaggedArray.Rank != 3 || jaggedArray.GetLength(0) != 1)
-//        {
-//            Console.WriteLine("Unexpected shape for token embeddings.");
-//            return null;
-//        }
+        normA = Math.Sqrt(normA);
+        normB = Math.Sqrt(normB);
 
-//        int seqLen = jaggedArray.GetLength(1);
-//        int embeddingDim = jaggedArray.GetLength(2);
-//        float[][] result = new float[seqLen][];
+        if (normA == 0 || normB == 0)
+        {
+            return 0.0;
+        }
 
-//        for (int i = 0; i < seqLen; i++)
-//        {
-//            result[i] = new float[embeddingDim];
-//            for (int j = 0; j < embeddingDim; j++)
-//            {
-//                result[i][j] = (float)jaggedArray.GetValue(0, i, j);
-//            }
-//        }
-//        return result;
-//    }
-
-//    // Helper function to convert jagged array (likely [1, embedding_size]) to single-dimensional array [embedding_size]
-//    private static float[] JaggedArrayToSingleDimensional(Array jaggedArray)
-//    {
-//        if (jaggedArray.Rank != 2 || jaggedArray.GetLength(0) != 1)
-//        {
-//            Console.WriteLine("Unexpected shape for sentence embedding.");
-//            return null;
-//        }
-
-//        int embeddingSize = jaggedArray.GetLength(1);
-//        float[] result = new float[embeddingSize];
-//        for (int i = 0; i < embeddingSize; i++)
-//        {
-//            result[i] = (float)jaggedArray.GetValue(0, i);
-//        }
-//        return result;
-//    }
-// }
+        return dotProduct / (normA * normB);
+    }
+}
